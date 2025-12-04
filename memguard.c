@@ -67,8 +67,10 @@
 #  define PMU_LLC_MISS_COUNTER_ID 0x17   // LINE_REFILL
 #  define PMU_LLC_WB_COUNTER_ID   0x18   // LINE_WB
 #elif defined(__x86_64__) || defined(__i386__)
-#  define PMU_LLC_MISS_COUNTER_ID 0x08b0 // OFFCORE_REQUESTS.ALL_DATA_RD
+#  define PMU_LLC_MISS_COUNTER_ID 0x821 // OFFCORE_REQUESTS.ALL_DATA_RD
 #  define PMU_LLC_WB_COUNTER_ID   0x40b0 // OFFCORE_REQUESTS.WB
+#  define STREAMING_STORES        0x12a   // event=0x2a | (umask=0x1 << 8)
+#  define STREAMING_STORES_OFFCORE 0x10800 // offcore_rsp mask -> config1
 #elif defined(__riscv)
 // Note: These performance counters are specific to the T-Head C910.
 // 		 They may not function correctly on other RISC-V designs.
@@ -170,10 +172,29 @@ static int g_use_exclusive = 0; /* 2 - spare bw sharing (rtas'13)
 				   5 - propotional sharing (tc'15) */
 static int g_qmin = INT_MAX;
 static int g_read_counter_id = PMU_LLC_MISS_COUNTER_ID;
+/*
+ * Default write counter uses streaming stores on Intel SPR (event=0x2a, umask=0x1)
+ * with OFFCORE_RSP mask in config1 (0x10800). For other architectures,
+ * fall back to PMU_LLC_WB_COUNTER_ID.
+ */
+#if defined(__x86_64__) || defined(__i386__)
+static int g_write_counter_id = STREAMING_STORES;
+#else
 static int g_write_counter_id = PMU_LLC_WB_COUNTER_ID; 
+#endif
 
 static struct dentry *memguard_dir;
 
+/* offcore_rsp / config1 support */
+static u64 g_read_config1 = 0;
+#if defined(__x86_64__) || defined(__i386__)
+static u64 g_write_config1 = STREAMING_STORES_OFFCORE;
+#else
+static u64 g_write_config1 = 0;
+#endif
+
+static u64 __percpu *raw_read_prev;
+static u64 __percpu *raw_write_prev;
 
 /**************************************************************************
  * External Function Prototypes
@@ -202,6 +223,11 @@ module_param(g_write_counter_id, hexint,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP)
 module_param(g_read_counter_id, int,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 module_param(g_write_counter_id, int,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 #endif
+
+module_param(g_read_config1, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_read_config1, "raw config1 (e.g., offcore_rsp mask) for read counter");
+module_param(g_write_config1, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_write_config1, "raw config1 (e.g., offcore_rsp mask) for write counter");
 
 module_param(g_period_us, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_period_us, "throttling period in usec");
@@ -750,7 +776,7 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
 }
 
-static struct perf_event *init_counter(int cpu, int budget, int counter_id, void *callback)
+static struct perf_event *init_counter(int cpu, int budget, int counter_id, u64 config1, void *callback)
 {
 	struct perf_event *event = NULL;
 	struct perf_event_attr sched_perf_hw_attr = {
@@ -763,8 +789,11 @@ static struct perf_event *init_counter(int cpu, int budget, int counter_id, void
 		.exclude_kernel = 1,   /* TODO: 1 mean, no kernel mode counting */
 	};
 
+	/* NEW: support OFFCORE_RESPONSE / config1 */
+	sched_perf_hw_attr.config1 = config1;
+
 	/* Try to register using hardware perf events */
-	event = perf_event_create_kernel_counter(
+	    event = perf_event_create_kernel_counter(
 		&sched_perf_hw_attr,
 		cpu, NULL,
 		callback
@@ -1051,43 +1080,135 @@ static const struct file_operations memguard_usage_fops = {
 	.release	= single_release,
 };
 
+/* expose raw event counts per CPU for streaming write counter */
+static int memguard_raw_events_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	seq_printf(m, "cpu  |write/s\n");
+	seq_printf(m, "------------------------------\n");
+
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+
+		u64 w_now = 0;
+		u64 w_prev = *per_cpu_ptr(raw_write_prev, i);
+
+		if (cinfo->write_event)
+			w_now = perf_event_count(cinfo->write_event);
+
+		u64 w_delta = w_now - w_prev;
+
+		/* update snapshot */
+		*per_cpu_ptr(raw_write_prev, i) = w_now;
+
+		seq_printf(m, "CPU%d: %llu\n",
+				   i,
+				   (unsigned long long)w_delta);
+	}
+
+	return 0;
+}
+
+
+static int memguard_raw_events_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, memguard_raw_events_show, NULL);
+}
+
+static const struct file_operations memguard_raw_events_fops = {
+	.open		= memguard_raw_events_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/* modified for easier limit setting */
 static ssize_t memguard_write_limit_write(struct file *filp,
 				    const char __user *ubuf,
 				    size_t cnt, loff_t *ppos)
 {
 	char buf[BUF_SIZE];
-	char *p = buf;
-	int i;
+	char *token, *p;
 	int use_mb = 0;
 
-	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0) 
-		return 0;
+	/* copy user input */
+	if (copy_from_user(&buf, ubuf, min(cnt, (size_t)BUF_SIZE-1)))
+		return -EFAULT;
 
+	buf[min(cnt, (size_t)BUF_SIZE-1)] = '\0';
+	p = buf;
+
+	/* optional "mb " prefix */
 	if (!strncmp(p, "mb ", 3)) {
 		use_mb = 1;
-		p+=3;
+		p += 3;
 	}
-	for_each_online_cpu(i) {
-		int input;
-		unsigned long events;
-		sscanf(p, "%d", &input);
-		if (input == 0) {
-			pr_err("ERR: CPU%d: input is zero: %s.\n",i, p);
+
+	/*
+	 * New parser:
+	 * Accepted syntaxes:
+	 *   cpu2=3000
+	 *   cpu2:3000
+	 *   2=3000
+	 *   2:3000
+	 *   2 3000     (pair format)
+	 */
+	while ((token = strsep(&p, " \t\n,")) != NULL) {
+
+		int cpu = -1;
+		unsigned long input = 0;
+		unsigned long events = 0;
+
+		if (*token == '\0')
+			continue;
+
+		/* Case 1: cpuX=Y or cpuX:Y */
+		if (sscanf(token, "cpu%d=%lu", &cpu, &input) == 2 ||
+		    sscanf(token, "cpu%d:%lu", &cpu, &input) == 2)
+			goto apply;
+
+		/* Case 2: X=Y or X:Y */
+		if (sscanf(token, "%d=%lu", &cpu, &input) == 2 ||
+		    sscanf(token, "%d:%lu", &cpu, &input) == 2)
+			goto apply;
+
+		/* Case 3: pair syntax: "<cpu> <value>" */
+		if (sscanf(token, "%d", &cpu) == 1) {
+			char *next = strsep(&p, " \t\n,");
+			if (!next)
+				break;
+			if (sscanf(next, "%lu", &input) != 1)
+				continue;
+			goto apply;
+		}
+
+		continue;
+
+apply:
+		/* validate CPU */
+		if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu)) {
+			pr_warn("memguard: ignoring invalid CPU %d\n", cpu);
 			continue;
 		}
-		if (use_mb)
-			events = (unsigned long)convert_mb_to_events(input);
-		else
-			events = input;
 
-		pr_info("CPU%d: New budget=%ld (%d %s)\n", i, 
-			events, input, (use_mb)?"MB/s": "events");
-		smp_call_function_single(i, __update_write_budget,
+		/* validate input value */
+		if (input == 0) {
+			pr_warn("memguard: ignoring zero write_limit for CPU%d\n",
+				 cpu);
+			continue;
+		}
+
+		/* convert MB → events if needed */
+		events = use_mb ?
+			 (unsigned long)convert_mb_to_events(input) :
+			 input;
+
+		pr_info("memguard: CPU%d new write_budget=%lu (%lu %s)\n",
+			cpu, events, input, use_mb ? "MB/s" : "events");
+
+		smp_call_function_single(cpu, __update_write_budget,
 					 (void *)events, 0);
-		
-		p = strchr(p, ' ');
-		if (!p) break;
-		p++;
 	}
 	return cnt;
 }
@@ -1144,6 +1265,10 @@ static int memguard_init_debugfs(void)
 
 	debugfs_create_file("usage", 0666, memguard_dir, NULL,
 			    &memguard_usage_fops);
+
+	/* raw per-CPU event counters */
+	debugfs_create_file("raw_events", 0444, memguard_dir, NULL,
+			    &memguard_raw_events_fops);
 	return 0;
 }
 
@@ -1222,12 +1347,29 @@ int init_module( void )
 		pr_info("RAW HW READ COUNTER ID: 0x%x\n", g_read_counter_id);
 	if (g_write_counter_id >= 0)
 		pr_info("RAW HW WRITE COUNTER ID: 0x%x\n", g_write_counter_id);	
+
+	if (g_read_config1)
+    pr_info("RAW HW READ CONFIG1 (offcore_rsp): 0x%llx\n",
+            (unsigned long long)g_read_config1);
+	if (g_write_config1)
+		pr_info("RAW HW WRITE CONFIG1 (offcore_rsp): 0x%llx\n",
+				(unsigned long long)g_write_config1);
+				
 	pr_info("HZ=%d, g_period_us=%d\n", HZ, g_period_us);
 	pr_info("g_read_budget_mb=%d, g_write_budget_mb=%d\n", g_read_budget_mb, g_write_budget_mb);
 	g_qmin = convert_mb_to_events(DEFAULT_QMIN_MB); // default 1000MB/s
 
 	pr_info("Initilizing perf counter\n");
 	core_info = alloc_percpu(struct core_info);
+
+	/* allocate per-CPU previous values for raw_events snapshot */
+	raw_read_prev  = alloc_percpu(u64);
+	raw_write_prev = alloc_percpu(u64);
+
+	for_each_online_cpu(i) {
+		*per_cpu_ptr(raw_read_prev, i)  = 0;
+		*per_cpu_ptr(raw_write_prev, i) = 0;
+	}
 
 	for_each_online_cpu(i) {
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
@@ -1241,10 +1383,12 @@ int init_module( void )
 		memset(cinfo, 0, sizeof(struct core_info));
 
 		/* create performance counter */
-		cinfo->read_event = init_counter(i, read_budget, g_read_counter_id,
-						 event_overflow_callback);
-		cinfo->write_event = init_counter(i, write_budget, g_write_counter_id,
-						  event_write_overflow_callback);
+		cinfo->read_event = init_counter(i, read_budget,
+										(u64)g_read_counter_id, g_read_config1,
+										event_overflow_callback);
+		cinfo->write_event = init_counter(i, write_budget,
+										(u64)g_write_counter_id, g_write_config1,
+										event_write_overflow_callback);
 		if (!cinfo->read_event || !cinfo->write_event)
 			break;
 
