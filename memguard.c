@@ -61,6 +61,13 @@
 
 #define DEFAULT_RD_BUDGET_MB 2000
 #define DEFAULT_WR_BUDGET_MB 1000
+
+#define DEFALUT_TOR_THRESHOLD 5000
+#define DEFAULT_WPQ_LAT_THRESHOLD 3000
+
+#define DEFAULT_RELAX_WRITE_MB 100000
+#define DEFAULT_WRITE_EVENTS_THRESHOLD 128
+
 #define DEFAULT_QMIN_MB       500
 
 #if defined(__aarch64__) || defined(__arm__)
@@ -71,6 +78,18 @@
 #  define PMU_LLC_WB_COUNTER_ID   0x40b0 // OFFCORE_REQUESTS.WB
 #  define STREAMING_STORES        0x12a   // event=0x2a | (umask=0x1 << 8)
 #  define STREAMING_STORES_OFFCORE 0x10800 // offcore_rsp mask -> config1
+#  define PMU_TOR_INS_COUNTER_ID  0xc86fff00000135ULL /* unc_cha_tor_inserts.ia_wcil (perf alias config) */
+#  define PMU_TOR_OCC_COUNTER_ID  0xc86fff00000136ULL /* unc_cha_tor_occupancy.ia_wcil (perf alias config) */
+#  define PMU_TOR_PMU_TYPE_DEFAULT 28      /* from /sys/devices/uncore_cha_0/type */
+
+#  define PMU_WPQ_OCC_PC0_ID 0x082   /* event=0x82, umask=0x00 */
+#  define PMU_WPQ_OCC_PC1_ID 0x083   /* event=0x83, umask=0x00 */
+#  define PMU_WPQ_INS_PC0_ID 0x120  /* event=0x20, umask=0x01 */
+#  define PMU_WPQ_INS_PC1_ID 0x220  /* event=0x20, umask=0x02 */
+/* Default HBM PMU index range (matches /sys/devices/uncore_hbm_{8..15}/type). */
+#  define PMU_WPQ_PMU_START 159
+#  define PMU_WPQ_PMU_END   174
+
 #elif defined(__riscv)
 // Note: These performance counters are specific to the T-Head C910.
 // 		 They may not function correctly on other RISC-V designs.
@@ -133,6 +152,11 @@ struct core_info {
 
 	struct irq_work write_pending;   /* delayed work for NMIs */
 	struct perf_event *write_event;  /* PMC: LLC writebacks */
+
+	struct perf_event *tor_ins_event;  /* TOR inserts counter */
+	struct perf_event *tor_occ_event;  /* TOR occupancy counter */
+	struct perf_event *wpq_occ_event;  /* WPQ occupancy counter */
+	struct perf_event *wpq_ins_event;  /* WPQ inserts counter */
     
 	struct task_struct *throttle_thread;  /* forced throttle idle thread */
 	wait_queue_head_t throttle_evt; /* throttle wait queue */
@@ -166,6 +190,12 @@ static int g_period_us = 1000;
 
 static int g_read_budget_mb = DEFAULT_RD_BUDGET_MB;
 static int g_write_budget_mb = DEFAULT_WR_BUDGET_MB;
+static int g_relax_write_budget_mb = DEFAULT_RELAX_WRITE_MB;
+static int g_tor_lat_threshold = DEFALUT_TOR_THRESHOLD;
+static int g_wpq_lat_threshold = DEFAULT_WPQ_LAT_THRESHOLD;
+static int g_write_events_threshold __maybe_unused = DEFAULT_WRITE_EVENTS_THRESHOLD;
+static int g_latency_hot = 0; /* 1 when TOR/WPQ latency above threshold */
+static u64 g_dynamic_write_limit_events = (u64)-1; /* (u64)-1 => use user limits */
 
 static int g_use_reclaim = 0;   /* 1 - enable reclaim of "guaranteed" bw */
 static int g_use_exclusive = 0; /* 2 - spare bw sharing (rtas'13) 
@@ -179,8 +209,31 @@ static int g_read_counter_id = PMU_LLC_MISS_COUNTER_ID;
  */
 #if defined(__x86_64__) || defined(__i386__)
 static int g_write_counter_id = STREAMING_STORES;
+static u64 g_tor_ins_counter_id = PMU_TOR_INS_COUNTER_ID; /*  raw TOR inserts */
+static u64 g_tor_occ_counter_id = PMU_TOR_OCC_COUNTER_ID; /*  raw TOR occupancy */
+static int g_tor_pmu_type = PMU_TOR_PMU_TYPE_DEFAULT;
+static u64 g_wpq_occ_pc0_counter_id = PMU_WPQ_OCC_PC0_ID;
+static u64 g_wpq_occ_pc1_counter_id = PMU_WPQ_OCC_PC1_ID;
+static u64 g_wpq_ins_pc0_counter_id = PMU_WPQ_INS_PC0_ID;
+static u64 g_wpq_ins_pc1_counter_id = PMU_WPQ_INS_PC1_ID;
 #else
 static int g_write_counter_id = PMU_LLC_WB_COUNTER_ID; 
+static u64 g_tor_ins_counter_id = 0;
+static u64 g_tor_occ_counter_id = 0;
+static int g_tor_pmu_type = -1;
+static u64 g_wpq_occ_pc0_counter_id = 0;
+static u64 g_wpq_ins_pc0_counter_id = 0;
+static u64 g_wpq_occ_pc1_counter_id = 0;
+static u64 g_wpq_ins_pc1_counter_id = 0;
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+/* WPQ PMU type range (defaults map to uncore_hbm_8..15) */
+static int g_wpq_pmu_type = PMU_WPQ_PMU_START;
+static int g_wpq_pmu_type_last = PMU_WPQ_PMU_END;
+#else
+static int g_wpq_pmu_type = -1;
+static int g_wpq_pmu_type_last = -1;
 #endif
 
 static struct dentry *memguard_dir;
@@ -195,6 +248,28 @@ static u64 g_write_config1 = 0;
 
 static u64 __percpu *raw_read_prev;
 static u64 __percpu *raw_write_prev;
+
+/* support multiple CHA counters: assume contiguous pmu_type range */
+#define MAX_TOR_CHA 64
+static u64 tor_ins_prev[MAX_TOR_CHA];
+static struct perf_event *tor_ins_event[MAX_TOR_CHA];
+static int tor_ins_count;
+static u64 tor_occ_prev[MAX_TOR_CHA];
+static struct perf_event *tor_occ_event[MAX_TOR_CHA];
+static int tor_occ_count;
+
+/* WPQ counters (HBM) */
+#define MAX_WPQ_HBM 16
+static u64 wpq_ins_pc0_prev[MAX_WPQ_HBM];
+static u64 wpq_ins_pc1_prev[MAX_WPQ_HBM];
+static u64 wpq_occ_pc0_prev[MAX_WPQ_HBM];
+static u64 wpq_occ_pc1_prev[MAX_WPQ_HBM];
+static struct perf_event *wpq_ins_pc0_event[MAX_WPQ_HBM];
+static struct perf_event *wpq_ins_pc1_event[MAX_WPQ_HBM];
+static struct perf_event *wpq_occ_pc0_event[MAX_WPQ_HBM];
+static struct perf_event *wpq_occ_pc1_event[MAX_WPQ_HBM];
+static int wpq_ins_count;
+static int wpq_occ_count;
 
 /**************************************************************************
  * External Function Prototypes
@@ -236,6 +311,28 @@ module_param(g_read_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_read_budget_mb, "default read budget in MB/s");
 module_param(g_write_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_write_budget_mb, "default write budget in MB/s");
+module_param(g_relax_write_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_relax_write_budget_mb, "write budget (MB/s) to use when latency is below thresholds");
+module_param(g_tor_lat_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_tor_lat_threshold, "TOR latency threshold (occupancy/inserts) before throttling");
+module_param(g_wpq_lat_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_wpq_lat_threshold, "WPQ latency threshold (occupancy/inserts) before throttling");
+module_param(g_write_events_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_write_events_threshold, "per-CPU write event delta threshold to treat as attacker");
+module_param(g_tor_ins_counter_id, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_tor_ins_counter_id, "raw config for CHA TOR inserts (unc_cha_tor_inserts.ia_wcil)");
+module_param(g_tor_occ_counter_id, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_tor_occ_counter_id, "raw config for CHA TOR occupancy (unc_cha_tor_occupancy.ia_wcil)");
+module_param(g_tor_pmu_type, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_tor_pmu_type, "PMU type id for CHA TOR counters (e.g., /sys/devices/uncore_cha_0/type)");
+/* if last < first, autoprobes upward until failures */
+static int g_tor_pmu_type_last = 67;
+module_param(g_tor_pmu_type_last, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_tor_pmu_type_last, "Last PMU type id (inclusive) for CHA TOR inserts; -1 to auto-probe contiguous types");
+module_param(g_wpq_pmu_type, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_wpq_pmu_type, "PMU type id for uncore_hbm_*/WPQ counters (e.g., /sys/devices/uncore_hbm_0/type)");
+module_param(g_wpq_pmu_type_last, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_wpq_pmu_type_last, "Last PMU type id (inclusive) for WPQ counters; -1 to auto-probe contiguous types");
 /**************************************************************************
  * Module main code
  **************************************************************************/
@@ -731,8 +828,21 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	/* new budget assignment from user */
 	if (cinfo->read_limit > 0)
 		cinfo->read_budget = max(cinfo->read_limit, 1);
-	if (cinfo->write_limit > 0)
-		cinfo->write_budget = max(cinfo->write_limit, 1);
+
+	/*
+	 * Apply latency-based dynamic write cap as a ceiling on top of the
+	 * user-configured per-CPU write_limit.
+	 */
+	if (cinfo->write_limit > 0) {
+		int write_budget = max(cinfo->write_limit, 1);
+		u64 dyn = READ_ONCE(g_dynamic_write_limit_events);
+
+		if (dyn != (u64)-1) {
+			u64 capped = min_t(u64, dyn, (u64)INT_MAX);
+			write_budget = min_t(int, write_budget, (int)capped);
+		}
+		cinfo->write_budget = write_budget;
+	}
 
 	if (cinfo->read_event->hw.sample_period != cinfo->read_budget) {
 		/* new budget is assigned */
@@ -776,17 +886,19 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
 }
 
-static struct perf_event *init_counter(int cpu, int budget, int counter_id, u64 config1, void *callback)
+static struct perf_event *init_counter(int cpu, int budget, u64 counter_id, u64 config1,
+				       void *callback, int pmu_type, int exclude_kernel)
 {
 	struct perf_event *event = NULL;
+	u64 sample_period = budget ? (u64)budget : 0; /* counting-only if budget==0 */
 	struct perf_event_attr sched_perf_hw_attr = {
-		.type		= PERF_TYPE_RAW,
+		.type		= pmu_type,
 		.size		= sizeof(struct perf_event_attr),
 		.pinned		= 1,
 		.disabled	= 1,
 		.config         = counter_id,
-		.sample_period  = budget, 
-		.exclude_kernel = 1,   /* TODO: 1 mean, no kernel mode counting */
+		.sample_period  = sample_period,
+		.exclude_kernel = exclude_kernel,
 	};
 
 	/* NEW: support OFFCORE_RESPONSE / config1 */
@@ -818,7 +930,7 @@ static struct perf_event *init_counter(int cpu, int budget, int counter_id, u64 
 	}
 
 	/* success path */
-	pr_info("cpu%d enabled counter 0x%x\n", cpu, counter_id);
+		pr_info("cpu%d enabled counter 0x%llx\n", cpu, (unsigned long long)counter_id);
 
 	return event;
 }
@@ -832,12 +944,12 @@ static void __start_counter(void *info)
 
 
 	/* initialize hr timer */
-        hrtimer_init(&cinfo->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
-        cinfo->hr_timer.function = &period_timer_callback_master;
+	hrtimer_init(&cinfo->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+	cinfo->hr_timer.function = &period_timer_callback_master;
 
 	/* start timer */
-        hrtimer_start(&cinfo->hr_timer, global->period_in_ktime,
-                      HRTIMER_MODE_REL_PINNED);
+	hrtimer_start(&cinfo->hr_timer, global->period_in_ktime,
+					HRTIMER_MODE_REL_PINNED);
 
 	/* initialize */
 	cinfo->throttled_task = NULL;
@@ -1085,8 +1197,114 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 {
 	int i;
 
+	u64 tor_delta = 0;
+	u64 tor_occ_delta = 0;
+	u64 wpq_occ_delta = 0;
+	u64 wpq_ins_delta = 0;
+	/* global TOR inserts observer (sum over CHA range) */
+	if (tor_ins_count > 0) {
+		int idx;
+		for (idx = 0; idx < tor_ins_count; idx++) {
+			u64 enabled = 0, running = 0;
+			/*
+			 * TOR counters run in counting mode (no interrupts), so the core
+			 * perf framework never updates event->count unless we trigger a
+			 * read. perf_event_read_value() forces a PMU read and refreshes
+			 * event->count, otherwise we would always see 0 here.
+			 */
+			u64 tor_now = perf_event_read_value(tor_ins_event[idx],
+						       &enabled, &running);
+			tor_delta += tor_now - tor_ins_prev[idx];
+			tor_ins_prev[idx] = tor_now;
+		}
+	}
+	/* global TOR occupancy observer (sum over CHA range) */
+	if (tor_occ_count > 0) {
+		int idx;
+		for (idx = 0; idx < tor_occ_count; idx++) {
+			u64 enabled = 0, running = 0;
+			u64 tor_now = perf_event_read_value(tor_occ_event[idx],
+						       &enabled, &running);
+			tor_occ_delta += tor_now - tor_occ_prev[idx];
+			tor_occ_prev[idx] = tor_now;
+		}
+	}
+	/* WPQ observer (sum over HBM PMUs) */
+	if (wpq_occ_count > 0 || wpq_ins_count > 0) {
+		int idx;
+		for (idx = 0; idx < wpq_occ_count; idx++) {
+			u64 enabled = 0, running = 0;
+			u64 now_0 = perf_event_read_value(wpq_occ_pc0_event[idx],
+							  &enabled, &running);
+			u64 now_1 = perf_event_read_value(wpq_occ_pc1_event[idx],
+							  &enabled, &running);
+			wpq_occ_delta += (now_0 + now_1) -
+					 (wpq_occ_pc0_prev[idx] + wpq_occ_pc1_prev[idx]);
+			wpq_occ_pc0_prev[idx] = now_0;
+			wpq_occ_pc1_prev[idx] = now_1;
+		}
+		for (idx = 0; idx < wpq_ins_count; idx++) {
+			u64 enabled = 0, running = 0;
+			u64 now_0 = perf_event_read_value(wpq_ins_pc0_event[idx],
+							  &enabled, &running);
+			u64 now_1 = perf_event_read_value(wpq_ins_pc1_event[idx],
+							  &enabled, &running);
+			wpq_ins_delta += (now_0 + now_1) -
+					 (wpq_ins_pc0_prev[idx] + wpq_ins_pc1_prev[idx]);
+			wpq_ins_pc0_prev[idx] = now_0;
+			wpq_ins_pc1_prev[idx] = now_1;
+		}
+	}
+
+	u64 tor_lat = 0, wpq_lat = 0;
+	int hot = 0;
+	
+	if (tor_delta > 0)
+		tor_lat = div64_u64(tor_occ_delta, tor_delta);
+	if (wpq_ins_delta > 0)
+		wpq_lat = div64_u64(wpq_occ_delta, wpq_ins_delta);
+	if (g_tor_lat_threshold > 0 && tor_delta > 0 &&
+	    tor_lat > (u64)g_tor_lat_threshold)
+		hot = 1;
+	if (g_wpq_lat_threshold > 0 && wpq_ins_delta > 0 &&
+	    wpq_lat > (u64)g_wpq_lat_threshold)
+		hot = 1;
+
+	/* If we can't compute latency this time, don't change gating state. */
+	if (g_tor_lat_threshold <= 0 || tor_delta <= 0)
+		goto out_latency_gating;
+	if (g_wpq_lat_threshold > 0 && wpq_ins_delta <= 0)
+		goto out_latency_gating;
+
+	/*
+	 * Latency gating: when memory is "hot", cap write bandwidth to
+	 * g_write_events_threshold; otherwise relax up to g_relax_write_budget_mb.
+	 * The cap is applied in the periodic budget assignment path.
+	 */
+	int target_mb = hot ? g_write_events_threshold : g_relax_write_budget_mb;
+	u64 target_events = (target_mb > 0) ?
+				convert_mb_to_events(target_mb) :
+				(u64)-1;
+	u64 prev_events = READ_ONCE(g_dynamic_write_limit_events);
+	int prev_hot = READ_ONCE(g_latency_hot);
+
+
+	WRITE_ONCE(g_latency_hot, hot);
+	WRITE_ONCE(g_dynamic_write_limit_events, target_events);
+
+out_latency_gating:
+	
+
 	seq_printf(m, "cpu  |write/s\n");
 	seq_printf(m, "------------------------------\n");
+
+	seq_printf(m, "TOR inserts delta: %llu\n", (unsigned long long)tor_delta);
+	seq_printf(m, "TOR occupancy delta: %llu\n",
+		   (unsigned long long)tor_occ_delta);
+	seq_printf(m, "WPQ inserts delta: %llu\n",
+		   (unsigned long long)wpq_ins_delta);
+	seq_printf(m, "WPQ occupancy delta: %llu\n",
+		   (unsigned long long)wpq_occ_delta);
 
 	for_each_online_cpu(i) {
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
@@ -1358,6 +1576,7 @@ int init_module( void )
 	pr_info("HZ=%d, g_period_us=%d\n", HZ, g_period_us);
 	pr_info("g_read_budget_mb=%d, g_write_budget_mb=%d\n", g_read_budget_mb, g_write_budget_mb);
 	g_qmin = convert_mb_to_events(DEFAULT_QMIN_MB); // default 1000MB/s
+	g_dynamic_write_limit_events = convert_mb_to_events(g_relax_write_budget_mb);
 
 	pr_info("Initilizing perf counter\n");
 	core_info = alloc_percpu(struct core_info);
@@ -1365,6 +1584,134 @@ int init_module( void )
 	/* allocate per-CPU previous values for raw_events snapshot */
 	raw_read_prev  = alloc_percpu(u64);
 	raw_write_prev = alloc_percpu(u64);
+
+	/* optional global TOR inserts observers (range of CHA PMUs) */
+	for (i = 0; i < MAX_TOR_CHA; i++) {
+		tor_ins_prev[i] = 0;
+		tor_ins_event[i] = NULL;
+		tor_occ_prev[i] = 0;
+		tor_occ_event[i] = NULL;
+	}
+	tor_ins_count = 0;
+	tor_occ_count = 0;
+
+	/* clear WPQ state */
+	for (i = 0; i < MAX_WPQ_HBM; i++) {
+		wpq_ins_pc0_prev[i] = 0;
+		wpq_ins_pc1_prev[i] = 0;
+		wpq_occ_pc0_prev[i] = 0;
+		wpq_occ_pc1_prev[i] = 0;
+		wpq_ins_pc0_event[i] = NULL;
+		wpq_ins_pc1_event[i] = NULL;
+		wpq_occ_pc0_event[i] = NULL;
+		wpq_occ_pc1_event[i] = NULL;
+	}
+	wpq_ins_count = 0;
+	wpq_occ_count = 0;
+
+	if (g_tor_ins_counter_id != 0 && g_tor_pmu_type > 0) {
+		int type;
+		int max_type = (g_tor_pmu_type_last >= g_tor_pmu_type) ?
+				g_tor_pmu_type_last :
+				g_tor_pmu_type + MAX_TOR_CHA - 1;
+
+		for (type = g_tor_pmu_type;
+		     type <= max_type && tor_ins_count < MAX_TOR_CHA;
+		     type++) {
+			struct perf_event *ev = init_counter(0, 0,
+							     g_tor_ins_counter_id, 0,
+							     NULL, type, 0);
+			if (!ev || IS_ERR(ev)) {
+				pr_warn("memguard: failed TOR counter pmu_type=%d (config=0x%llx)\n",
+					type,
+					(unsigned long long)g_tor_ins_counter_id);
+				continue;
+			}
+			perf_event_enable(ev);
+			tor_ins_event[tor_ins_count] = ev;
+			tor_ins_prev[tor_ins_count] = 0;
+			tor_ins_count++;
+		}
+	}
+	if (g_tor_occ_counter_id != 0 && g_tor_pmu_type > 0) {
+		int type;
+		int max_type = (g_tor_pmu_type_last >= g_tor_pmu_type) ?
+				g_tor_pmu_type_last :
+				g_tor_pmu_type + MAX_TOR_CHA - 1;
+
+		for (type = g_tor_pmu_type;
+		     type <= max_type && tor_occ_count < MAX_TOR_CHA;
+		     type++) {
+			struct perf_event *ev = init_counter(0, 0,
+							     g_tor_occ_counter_id, 0,
+							     NULL, type, 0);
+			if (!ev || IS_ERR(ev)) {
+				pr_warn("memguard: failed TOR occupancy counter pmu_type=%d (config=0x%llx)\n",
+					type,
+					(unsigned long long)g_tor_occ_counter_id);
+				continue;
+			}
+			perf_event_enable(ev);
+			tor_occ_event[tor_occ_count] = ev;
+			tor_occ_prev[tor_occ_count] = 0;
+			tor_occ_count++;
+		}
+	}
+
+	/*  WPQ counters across HBM PMUs */
+	if (g_wpq_pmu_type > 0) {
+		int type;
+		int max_type = (g_wpq_pmu_type_last >= g_wpq_pmu_type) ?
+			       g_wpq_pmu_type_last :
+			       g_wpq_pmu_type + (PMU_WPQ_PMU_END - PMU_WPQ_PMU_START);
+		int wpq_count = 0;
+
+		for (type = g_wpq_pmu_type;
+		     type <= max_type && wpq_count < MAX_WPQ_HBM;
+		     type++) {
+
+			struct perf_event *occ0 = NULL, *occ1 = NULL;
+			struct perf_event *ins0 = NULL, *ins1 = NULL;
+			u64 occ0_cfg = g_wpq_occ_pc0_counter_id ? g_wpq_occ_pc0_counter_id : PMU_WPQ_OCC_PC0_ID;
+			u64 occ1_cfg = g_wpq_occ_pc1_counter_id ? g_wpq_occ_pc1_counter_id : PMU_WPQ_OCC_PC1_ID;
+			u64 ins0_cfg = g_wpq_ins_pc0_counter_id ? g_wpq_ins_pc0_counter_id : PMU_WPQ_INS_PC0_ID;
+			u64 ins1_cfg = g_wpq_ins_pc1_counter_id ? g_wpq_ins_pc1_counter_id : PMU_WPQ_INS_PC1_ID;
+
+			occ0 = init_counter(0, 0, occ0_cfg, 0, NULL, type, 0);
+			occ1 = init_counter(0, 0, occ1_cfg, 0, NULL, type, 0);
+			ins0 = init_counter(0, 0, ins0_cfg, 0, NULL, type, 0);
+			ins1 = init_counter(0, 0, ins1_cfg, 0, NULL, type, 0);
+
+			if (!occ0 || !occ1 || !ins0 || !ins1) {
+				pr_warn("memguard: failed WPQ counters pmu_type=%d\n", type);
+				if (occ0) perf_event_release_kernel(occ0);
+				if (occ1) perf_event_release_kernel(occ1);
+				if (ins0) perf_event_release_kernel(ins0);
+				if (ins1) perf_event_release_kernel(ins1);
+				continue;
+			}
+
+			perf_event_enable(occ0);
+			perf_event_enable(occ1);
+			perf_event_enable(ins0);
+			perf_event_enable(ins1);
+
+			wpq_occ_pc0_event[wpq_count] = occ0;
+			wpq_occ_pc1_event[wpq_count] = occ1;
+			wpq_ins_pc0_event[wpq_count] = ins0;
+			wpq_ins_pc1_event[wpq_count] = ins1;
+			wpq_occ_pc0_prev[wpq_count] = 0;
+			wpq_occ_pc1_prev[wpq_count] = 0;
+			wpq_ins_pc0_prev[wpq_count] = 0;
+			wpq_ins_pc1_prev[wpq_count] = 0;
+
+			wpq_count++;
+		}
+
+		/* keep counts aligned across pc0/pc1 for occ/ins */
+		wpq_occ_count = wpq_count;
+		wpq_ins_count = wpq_count;
+	}
 
 	for_each_online_cpu(i) {
 		*per_cpu_ptr(raw_read_prev, i)  = 0;
@@ -1384,11 +1731,11 @@ int init_module( void )
 
 		/* create performance counter */
 		cinfo->read_event = init_counter(i, read_budget,
-										(u64)g_read_counter_id, g_read_config1,
-										event_overflow_callback);
+							(u64)g_read_counter_id, g_read_config1,
+							event_overflow_callback, PERF_TYPE_RAW, 1);
 		cinfo->write_event = init_counter(i, write_budget,
-										(u64)g_write_counter_id, g_write_config1,
-										event_write_overflow_callback);
+							(u64)g_write_counter_id, g_write_config1,
+							event_write_overflow_callback, PERF_TYPE_RAW, 1);
 		if (!cinfo->read_event || !cinfo->write_event)
 			break;
 
@@ -1460,29 +1807,120 @@ void cleanup_module( void )
 
 	/* stop perf_event counters and timers */
 	on_each_cpu(__stop_counter, NULL, 0);
-	pr_info("LLC bandwidth throttling disabled\n");
+	smp_mb(); /* make exit flag visible to all CPUs */
 
-	/* destroy perf objects */
+	/*
+	 * Stop per-CPU period timers from process context (not via on_each_cpu),
+	 * to avoid deadlocking by interrupting a running hrtimer callback.
+	 */
 	for_each_online_cpu(i) {
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
-		pr_info("Stopping kthrottle/%d\n", i);
-		kthread_stop(cinfo->throttle_thread);
-		perf_event_disable(cinfo->read_event);
-		perf_event_release_kernel(cinfo->read_event); 
-		cinfo->read_event = NULL; 
-        
-		perf_event_disable(cinfo->write_event);
-		perf_event_release_kernel(cinfo->write_event);
-		cinfo->write_event = NULL;
+		if (!cinfo)
+			continue;
+		cinfo->throttled_task = NULL;
+		hrtimer_cancel(&cinfo->hr_timer);
 	}
 
-	/* remove debugfs entries */
-	debugfs_remove_recursive(memguard_dir);
+	/* Disable perf events and flush queued overflow work. */
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		if (!cinfo)
+			continue;
+
+		irq_work_sync(&cinfo->read_pending);
+		irq_work_sync(&cinfo->write_pending);
+
+		if (cinfo->read_event)
+			perf_event_disable(cinfo->read_event);
+		if (cinfo->write_event)
+			perf_event_disable(cinfo->write_event);
+	}
+
+	pr_info("LLC bandwidth throttling disabled\n");
+
+	/* stop per-CPU throttle threads */
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		if (!cinfo)
+			continue;
+		pr_info("Stopping kthrottle/%d\n", i);
+		if (cinfo->throttle_thread) {
+			kthread_stop(cinfo->throttle_thread);
+			cinfo->throttle_thread = NULL;
+		}
+	}
+
+	/* release per-CPU perf events */
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		if (!cinfo)
+			continue;
+		if (cinfo->read_event) {
+			perf_event_release_kernel(cinfo->read_event);
+			cinfo->read_event = NULL;
+		}
+		if (cinfo->write_event) {
+			perf_event_release_kernel(cinfo->write_event);
+			cinfo->write_event = NULL;
+		}
+	}
+
+	for (i = 0; i < tor_ins_count; i++) {
+		if (tor_ins_event[i]) {
+			perf_event_disable(tor_ins_event[i]);
+			perf_event_release_kernel(tor_ins_event[i]);
+			tor_ins_event[i] = NULL;
+		}
+	}
+	for (i = 0; i < tor_occ_count; i++) {
+		if (tor_occ_event[i]) {
+			perf_event_disable(tor_occ_event[i]);
+			perf_event_release_kernel(tor_occ_event[i]);
+			tor_occ_event[i] = NULL;
+		}
+	}
+	for (i = 0; i < wpq_occ_count; i++) {
+		if (wpq_occ_pc0_event[i]) {
+			perf_event_disable(wpq_occ_pc0_event[i]);
+			perf_event_release_kernel(wpq_occ_pc0_event[i]);
+			wpq_occ_pc0_event[i] = NULL;
+		}
+		if (wpq_occ_pc1_event[i]) {
+			perf_event_disable(wpq_occ_pc1_event[i]);
+			perf_event_release_kernel(wpq_occ_pc1_event[i]);
+			wpq_occ_pc1_event[i] = NULL;
+		}
+	}
+	for (i = 0; i < wpq_ins_count; i++) {
+		if (wpq_ins_pc0_event[i]) {
+			perf_event_disable(wpq_ins_pc0_event[i]);
+			perf_event_release_kernel(wpq_ins_pc0_event[i]);
+			wpq_ins_pc0_event[i] = NULL;
+		}
+		if (wpq_ins_pc1_event[i]) {
+			perf_event_disable(wpq_ins_pc1_event[i]);
+			perf_event_release_kernel(wpq_ins_pc1_event[i]);
+			wpq_ins_pc1_event[i] = NULL;
+		}
+	}
 
 	/* free allocated data structure */
+	if (raw_read_prev) {
+		free_percpu(raw_read_prev);
+		raw_read_prev = NULL;
+	}
+	if (raw_write_prev) {
+		free_percpu(raw_write_prev);
+		raw_write_prev = NULL;
+	}
 	free_cpumask_var(global->throttle_mask);
 	free_cpumask_var(global->active_mask);
 	free_percpu(core_info);
+	core_info = NULL;
+	tor_ins_count = 0;
+	tor_occ_count = 0;
+	wpq_ins_count = 0;
+	wpq_occ_count = 0;
 	pr_info("module uninstalled successfully\n");
 	return;
 }
