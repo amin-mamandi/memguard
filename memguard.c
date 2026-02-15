@@ -59,14 +59,14 @@
 #define BUF_SIZE 256
 #define PREDICTOR 1  /* 0 - used, 1 - ewma(a=1/2), 2 - ewma(a=1/4) */
 
-#define DEFAULT_RD_BUDGET_MB 2000
-#define DEFAULT_WR_BUDGET_MB 1000
+#define DEFAULT_RD_BUDGET_MB 200000
+#define DEFAULT_WR_BUDGET_MB 200000
 
 #define DEFALUT_TOR_THRESHOLD 5000
 #define DEFAULT_WPQ_LAT_THRESHOLD 3000
 
 #define DEFAULT_RELAX_WRITE_MB 100000
-#define DEFAULT_WRITE_EVENTS_THRESHOLD 128
+#define DEFAULT_THROTTLE_WRITE_MB 256
 
 #define DEFAULT_QMIN_MB       500
 
@@ -191,9 +191,9 @@ static int g_period_us = 1000;
 static int g_read_budget_mb = DEFAULT_RD_BUDGET_MB;
 static int g_write_budget_mb = DEFAULT_WR_BUDGET_MB;
 static int g_relax_write_budget_mb = DEFAULT_RELAX_WRITE_MB;
+static int g_throttle_write_budget_mb = DEFAULT_THROTTLE_WRITE_MB;
 static int g_tor_lat_threshold = DEFALUT_TOR_THRESHOLD;
 static int g_wpq_lat_threshold = DEFAULT_WPQ_LAT_THRESHOLD;
-static int g_write_events_threshold __maybe_unused = DEFAULT_WRITE_EVENTS_THRESHOLD;
 static int g_latency_hot = 0; /* 1 when TOR/WPQ latency above threshold */
 static u64 g_dynamic_write_limit_events = (u64)-1; /* (u64)-1 => use user limits */
 
@@ -313,12 +313,12 @@ module_param(g_write_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_write_budget_mb, "default write budget in MB/s");
 module_param(g_relax_write_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_relax_write_budget_mb, "write budget (MB/s) to use when latency is below thresholds");
+module_param(g_throttle_write_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_throttle_write_budget_mb, "write budget (MB/s) to use when latency is above thresholds");	
 module_param(g_tor_lat_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_tor_lat_threshold, "TOR latency threshold (occupancy/inserts) before throttling");
 module_param(g_wpq_lat_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_wpq_lat_threshold, "WPQ latency threshold (occupancy/inserts) before throttling");
-module_param(g_write_events_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-MODULE_PARM_DESC(g_write_events_threshold, "per-CPU write event delta threshold to treat as attacker");
 module_param(g_tor_ins_counter_id, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_tor_ins_counter_id, "raw config for CHA TOR inserts (unc_cha_tor_inserts.ia_wcil)");
 module_param(g_tor_occ_counter_id, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
@@ -1278,10 +1278,10 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 
 	/*
 	 * Latency gating: when memory is "hot", cap write bandwidth to
-	 * g_write_events_threshold; otherwise relax up to g_relax_write_budget_mb.
+	 * g_write_budget_mb; otherwise relax up to g_relax_write_budget_mb.
 	 * The cap is applied in the periodic budget assignment path.
 	 */
-	int target_mb = hot ? g_write_events_threshold : g_relax_write_budget_mb;
+	int target_mb = hot ? g_throttle_write_budget_mb : g_relax_write_budget_mb;
 	u64 target_events = (target_mb > 0) ?
 				convert_mb_to_events(target_mb) :
 				(u64)-1;
