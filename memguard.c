@@ -195,6 +195,7 @@ static int g_throttle_write_budget_mb = DEFAULT_THROTTLE_WRITE_MB;
 static int g_tor_lat_threshold = DEFALUT_TOR_THRESHOLD;
 static int g_wpq_lat_threshold = DEFAULT_WPQ_LAT_THRESHOLD;
 static int g_latency_hot = 0; /* 1 when TOR/WPQ latency above threshold */
+static int g_use_wpq = 0;
 static u64 g_dynamic_write_limit_events = (u64)-1; /* (u64)-1 => use user limits */
 
 static int g_use_reclaim = 0;   /* 1 - enable reclaim of "guaranteed" bw */
@@ -325,6 +326,9 @@ module_param(g_tor_occ_counter_id, ullong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP
 MODULE_PARM_DESC(g_tor_occ_counter_id, "raw config for CHA TOR occupancy (unc_cha_tor_occupancy.ia_wcil)");
 module_param(g_tor_pmu_type, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_tor_pmu_type, "PMU type id for CHA TOR counters (e.g., /sys/devices/uncore_cha_0/type)");
+module_param(g_use_wpq, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_use_wpq, "Enable WPQ counters/latency gating (0=off, 1=on)");
+
 /* if last < first, autoprobes upward until failures */
 static int g_tor_pmu_type_last = 67;
 module_param(g_tor_pmu_type_last, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
@@ -374,6 +378,21 @@ static inline u64 perf_event_count(struct perf_event *event)
 {
 	return local64_read(&event->count) + 
 		atomic64_read(&event->child_count);
+}
+
+/*
+ * Best-effort read for debug/telemetry paths:
+ * force a PMU read when available, then return the software count snapshot.
+ */
+static inline u64 perf_event_count_fresh(struct perf_event *event)
+{
+	if (!event)
+		return 0;
+
+	if (event->pmu && event->pmu->read)
+		event->pmu->read(event);
+
+	return perf_event_count(event);
 }
 
 /** return used event in the current period */
@@ -1205,15 +1224,12 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 	if (tor_ins_count > 0) {
 		int idx;
 		for (idx = 0; idx < tor_ins_count; idx++) {
-			u64 enabled = 0, running = 0;
-			/*
-			 * TOR counters run in counting mode (no interrupts), so the core
-			 * perf framework never updates event->count unless we trigger a
-			 * read. perf_event_read_value() forces a PMU read and refreshes
-			 * event->count, otherwise we would always see 0 here.
-			 */
-			u64 tor_now = perf_event_read_value(tor_ins_event[idx],
-						       &enabled, &running);
+			struct perf_event *ev = tor_ins_event[idx];
+			u64 tor_now;
+
+			if (!ev)
+				continue;
+			tor_now = perf_event_count_fresh(ev);
 			tor_delta += tor_now - tor_ins_prev[idx];
 			tor_ins_prev[idx] = tor_now;
 		}
@@ -1222,9 +1238,12 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 	if (tor_occ_count > 0) {
 		int idx;
 		for (idx = 0; idx < tor_occ_count; idx++) {
-			u64 enabled = 0, running = 0;
-			u64 tor_now = perf_event_read_value(tor_occ_event[idx],
-						       &enabled, &running);
+			struct perf_event *ev = tor_occ_event[idx];
+			u64 tor_now;
+
+			if (!ev)
+				continue;
+			tor_now = perf_event_count_fresh(ev);
 			tor_occ_delta += tor_now - tor_occ_prev[idx];
 			tor_occ_prev[idx] = tor_now;
 		}
@@ -1233,22 +1252,28 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 	if (wpq_occ_count > 0 || wpq_ins_count > 0) {
 		int idx;
 		for (idx = 0; idx < wpq_occ_count; idx++) {
-			u64 enabled = 0, running = 0;
-			u64 now_0 = perf_event_read_value(wpq_occ_pc0_event[idx],
-							  &enabled, &running);
-			u64 now_1 = perf_event_read_value(wpq_occ_pc1_event[idx],
-							  &enabled, &running);
+			struct perf_event *ev0 = wpq_occ_pc0_event[idx];
+			struct perf_event *ev1 = wpq_occ_pc1_event[idx];
+			u64 now_0, now_1;
+
+			if (!ev0 || !ev1)
+				continue;
+			now_0 = perf_event_count_fresh(ev0);
+			now_1 = perf_event_count_fresh(ev1);
 			wpq_occ_delta += (now_0 + now_1) -
 					 (wpq_occ_pc0_prev[idx] + wpq_occ_pc1_prev[idx]);
 			wpq_occ_pc0_prev[idx] = now_0;
 			wpq_occ_pc1_prev[idx] = now_1;
 		}
 		for (idx = 0; idx < wpq_ins_count; idx++) {
-			u64 enabled = 0, running = 0;
-			u64 now_0 = perf_event_read_value(wpq_ins_pc0_event[idx],
-							  &enabled, &running);
-			u64 now_1 = perf_event_read_value(wpq_ins_pc1_event[idx],
-							  &enabled, &running);
+			struct perf_event *ev0 = wpq_ins_pc0_event[idx];
+			struct perf_event *ev1 = wpq_ins_pc1_event[idx];
+			u64 now_0, now_1;
+
+			if (!ev0 || !ev1)
+				continue;
+			now_0 = perf_event_count_fresh(ev0);
+			now_1 = perf_event_count_fresh(ev1);
 			wpq_ins_delta += (now_0 + now_1) -
 					 (wpq_ins_pc0_prev[idx] + wpq_ins_pc1_prev[idx]);
 			wpq_ins_pc0_prev[idx] = now_0;
@@ -1261,6 +1286,7 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 	
 	if (tor_delta > 0)
 		tor_lat = div64_u64(tor_occ_delta, tor_delta);
+	
 	if (wpq_ins_delta > 0)
 		wpq_lat = div64_u64(wpq_occ_delta, wpq_ins_delta);
 	if (g_tor_lat_threshold > 0 && tor_delta > 0 &&
@@ -1273,7 +1299,7 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 	/* If we can't compute latency this time, don't change gating state. */
 	if (g_tor_lat_threshold <= 0 || tor_delta <= 0)
 		goto out_latency_gating;
-	if (g_wpq_lat_threshold > 0 && wpq_ins_delta <= 0)
+	if (g_use_wpq && g_wpq_lat_threshold > 0 && wpq_ins_delta <= 0)
 		goto out_latency_gating;
 
 	/*
@@ -1285,10 +1311,6 @@ static int memguard_raw_events_show(struct seq_file *m, void *v)
 	u64 target_events = (target_mb > 0) ?
 				convert_mb_to_events(target_mb) :
 				(u64)-1;
-	u64 prev_events = READ_ONCE(g_dynamic_write_limit_events);
-	int prev_hot = READ_ONCE(g_latency_hot);
-
-
 	WRITE_ONCE(g_latency_hot, hot);
 	WRITE_ONCE(g_dynamic_write_limit_events, target_events);
 
@@ -1305,7 +1327,6 @@ out_latency_gating:
 		   (unsigned long long)wpq_ins_delta);
 	seq_printf(m, "WPQ occupancy delta: %llu\n",
 		   (unsigned long long)wpq_occ_delta);
-
 	for_each_online_cpu(i) {
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 
@@ -1658,59 +1679,64 @@ int init_module( void )
 		}
 	}
 
-	/*  WPQ counters across HBM PMUs */
-	if (g_wpq_pmu_type > 0) {
-		int type;
-		int max_type = (g_wpq_pmu_type_last >= g_wpq_pmu_type) ?
-			       g_wpq_pmu_type_last :
-			       g_wpq_pmu_type + (PMU_WPQ_PMU_END - PMU_WPQ_PMU_START);
-		int wpq_count = 0;
+	if (g_use_wpq) {
+		/*  WPQ counters across HBM PMUs */
+		if (g_wpq_pmu_type > 0) {
+			int type;
+			int max_type = (g_wpq_pmu_type_last >= g_wpq_pmu_type) ?
+					g_wpq_pmu_type_last :
+					g_wpq_pmu_type + (PMU_WPQ_PMU_END - PMU_WPQ_PMU_START);
+			int wpq_count = 0;
 
-		for (type = g_wpq_pmu_type;
-		     type <= max_type && wpq_count < MAX_WPQ_HBM;
-		     type++) {
+			for (type = g_wpq_pmu_type;
+				type <= max_type && wpq_count < MAX_WPQ_HBM;
+				type++) {
 
-			struct perf_event *occ0 = NULL, *occ1 = NULL;
-			struct perf_event *ins0 = NULL, *ins1 = NULL;
-			u64 occ0_cfg = g_wpq_occ_pc0_counter_id ? g_wpq_occ_pc0_counter_id : PMU_WPQ_OCC_PC0_ID;
-			u64 occ1_cfg = g_wpq_occ_pc1_counter_id ? g_wpq_occ_pc1_counter_id : PMU_WPQ_OCC_PC1_ID;
-			u64 ins0_cfg = g_wpq_ins_pc0_counter_id ? g_wpq_ins_pc0_counter_id : PMU_WPQ_INS_PC0_ID;
-			u64 ins1_cfg = g_wpq_ins_pc1_counter_id ? g_wpq_ins_pc1_counter_id : PMU_WPQ_INS_PC1_ID;
+				struct perf_event *occ0 = NULL, *occ1 = NULL;
+				struct perf_event *ins0 = NULL, *ins1 = NULL;
+				u64 occ0_cfg = g_wpq_occ_pc0_counter_id ? g_wpq_occ_pc0_counter_id : PMU_WPQ_OCC_PC0_ID;
+				u64 occ1_cfg = g_wpq_occ_pc1_counter_id ? g_wpq_occ_pc1_counter_id : PMU_WPQ_OCC_PC1_ID;
+				u64 ins0_cfg = g_wpq_ins_pc0_counter_id ? g_wpq_ins_pc0_counter_id : PMU_WPQ_INS_PC0_ID;
+				u64 ins1_cfg = g_wpq_ins_pc1_counter_id ? g_wpq_ins_pc1_counter_id : PMU_WPQ_INS_PC1_ID;
 
-			occ0 = init_counter(0, 0, occ0_cfg, 0, NULL, type, 0);
-			occ1 = init_counter(0, 0, occ1_cfg, 0, NULL, type, 0);
-			ins0 = init_counter(0, 0, ins0_cfg, 0, NULL, type, 0);
-			ins1 = init_counter(0, 0, ins1_cfg, 0, NULL, type, 0);
+				occ0 = init_counter(0, 0, occ0_cfg, 0, NULL, type, 0);
+				occ1 = init_counter(0, 0, occ1_cfg, 0, NULL, type, 0);
+				ins0 = init_counter(0, 0, ins0_cfg, 0, NULL, type, 0);
+				ins1 = init_counter(0, 0, ins1_cfg, 0, NULL, type, 0);
 
-			if (!occ0 || !occ1 || !ins0 || !ins1) {
-				pr_warn("memguard: failed WPQ counters pmu_type=%d\n", type);
-				if (occ0) perf_event_release_kernel(occ0);
-				if (occ1) perf_event_release_kernel(occ1);
-				if (ins0) perf_event_release_kernel(ins0);
-				if (ins1) perf_event_release_kernel(ins1);
-				continue;
+				if (!occ0 || !occ1 || !ins0 || !ins1) {
+					pr_warn("memguard: failed WPQ counters pmu_type=%d\n", type);
+					if (occ0) perf_event_release_kernel(occ0);
+					if (occ1) perf_event_release_kernel(occ1);
+					if (ins0) perf_event_release_kernel(ins0);
+					if (ins1) perf_event_release_kernel(ins1);
+					continue;
+				}
+
+				perf_event_enable(occ0);
+				perf_event_enable(occ1);
+				perf_event_enable(ins0);
+				perf_event_enable(ins1);
+
+				wpq_occ_pc0_event[wpq_count] = occ0;
+				wpq_occ_pc1_event[wpq_count] = occ1;
+				wpq_ins_pc0_event[wpq_count] = ins0;
+				wpq_ins_pc1_event[wpq_count] = ins1;
+				wpq_occ_pc0_prev[wpq_count] = 0;
+				wpq_occ_pc1_prev[wpq_count] = 0;
+				wpq_ins_pc0_prev[wpq_count] = 0;
+				wpq_ins_pc1_prev[wpq_count] = 0;
+
+				wpq_count++;
 			}
 
-			perf_event_enable(occ0);
-			perf_event_enable(occ1);
-			perf_event_enable(ins0);
-			perf_event_enable(ins1);
-
-			wpq_occ_pc0_event[wpq_count] = occ0;
-			wpq_occ_pc1_event[wpq_count] = occ1;
-			wpq_ins_pc0_event[wpq_count] = ins0;
-			wpq_ins_pc1_event[wpq_count] = ins1;
-			wpq_occ_pc0_prev[wpq_count] = 0;
-			wpq_occ_pc1_prev[wpq_count] = 0;
-			wpq_ins_pc0_prev[wpq_count] = 0;
-			wpq_ins_pc1_prev[wpq_count] = 0;
-
-			wpq_count++;
+			/* keep counts aligned across pc0/pc1 for occ/ins */
+			wpq_occ_count = wpq_count;
+			wpq_ins_count = wpq_count;
 		}
-
-		/* keep counts aligned across pc0/pc1 for occ/ins */
-		wpq_occ_count = wpq_count;
-		wpq_ins_count = wpq_count;
+	} else {
+		wpq_occ_count = 0;
+		wpq_ins_count = 0;
 	}
 
 	for_each_online_cpu(i) {
